@@ -95,3 +95,155 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+import os
+import gzip
+import json
+import pickle
+import zipfile
+import logging
+from typing import List
+import pandas as pd
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    precision_score, recall_score, f1_score,
+    balanced_accuracy_score, confusion_matrix
+)
+
+# Configuración inicial
+DATA_DIR = "files/input/"
+OUTPUT_DIR = "files/output/"
+MODEL_DIR = "files/models/"
+TRAIN_ZIP = "train_data.csv.zip"
+TEST_ZIP = "test_data.csv.zip"
+TRAIN_CSV = "train_default_of_credit_card_clients.csv"
+TEST_CSV = "test_default_of_credit_card_clients.csv"
+MODEL_NAME = "model.pkl.gz"
+METRICS_FILE = "metrics.json"
+
+CATEGORICAL_VARS = ["SEX", "EDUCATION", "MARRIAGE"]
+NUMERIC_VARS = [
+    "LIMIT_BAL", "AGE",
+    "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+    "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+    "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
+]
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger()
+
+
+def unzip_dataframe(zip_path: str, csv_name: str) -> pd.DataFrame:
+    with zipfile.ZipFile(zip_path, "r") as z:
+        with z.open(csv_name) as f:
+            return pd.read_csv(f)
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns=["ID"])
+    df = df.dropna()
+    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+    return df
+
+
+def build_pipeline() -> Pipeline:
+    transformer = ColumnTransformer(transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_VARS),
+        ("num", MinMaxScaler(), NUMERIC_VARS)
+    ])
+    pipeline = Pipeline(steps=[
+        ("transform", transformer),
+        ("select", SelectKBest(score_func=f_classif)),
+        ("model", LogisticRegression(max_iter=1000, solver="saga", random_state=42))
+    ])
+    return pipeline
+
+
+def get_param_grid():
+    return {
+        "select__k": range(1, 11),
+        "model__penalty": ["l1", "l2"],
+        "model__C": [0.001, 0.01, 0.1, 1, 10, 100]
+    }
+
+
+def save_model(model, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with gzip.open(path, "wb") as f:
+        pickle.dump(model, f)
+
+
+def compute_metrics(y_true, y_pred, dataset: str):
+    return {
+        "type": "metrics",
+        "dataset": dataset,
+        "precision": precision_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred)
+    }
+
+
+def compute_confusion(y_true, y_pred, dataset: str):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)}
+    }
+
+
+def save_metrics(metrics: List[dict], path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for entry in metrics:
+            json.dump(entry, f)
+            f.write("\n")
+
+
+def main():
+    # Paso 1: Cargar y limpiar datos
+    train_df = unzip_dataframe(os.path.join(DATA_DIR, TRAIN_ZIP), TRAIN_CSV)
+    test_df = unzip_dataframe(os.path.join(DATA_DIR, TEST_ZIP), TEST_CSV)
+    train_df = clean_data(train_df)
+    test_df = clean_data(test_df)
+
+    X_train = train_df.drop("default", axis=1)
+    y_train = train_df["default"]
+    X_test = test_df.drop("default", axis=1)
+    y_test = test_df["default"]
+
+    # Paso 2-4: Pipeline y optimización
+    pipe = build_pipeline()
+    grid = GridSearchCV(pipe, get_param_grid(), cv=10, scoring="balanced_accuracy", n_jobs=-1)
+    grid.fit(X_train, y_train)
+
+    # Paso 5: Guardar modelo
+    save_model(grid, os.path.join(MODEL_DIR, MODEL_NAME))
+
+    # Paso 6-7: Métricas
+    y_train_pred = grid.predict(X_train)
+    y_test_pred = grid.predict(X_test)
+
+    results = [
+        compute_metrics(y_train, y_train_pred, "train"),
+        compute_metrics(y_test, y_test_pred, "test"),
+        compute_confusion(y_train, y_train_pred, "train"),
+        compute_confusion(y_test, y_test_pred, "test"),
+    ]
+
+    save_metrics(results, os.path.join(OUTPUT_DIR, METRICS_FILE))
+
+
+main()
